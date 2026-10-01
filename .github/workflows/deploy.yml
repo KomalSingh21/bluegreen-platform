@@ -1,0 +1,270 @@
+name: Blue/Green Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Specific image tag to deploy (skip build)'
+        required: false
+      auto_promote:
+        description: 'Skip manual approval gate'
+        type: boolean
+        default: false
+      force_fail:
+        description: 'Force app failure (rollback test)'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # for OIDC
+  contents: read
+
+env:
+  AWS_REGION:        ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY:    ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER:       ${{ vars.ECS_CLUSTER }}
+  PROD_LISTENER_ARN: ${{ vars.PROD_LISTENER_ARN }}
+  TEST_LISTENER_ARN: ${{ vars.TEST_LISTENER_ARN }}
+  TG_BLUE_ARN:       ${{ vars.TG_BLUE_ARN }}
+  TG_GREEN_ARN:      ${{ vars.TG_GREEN_ARN }}
+  BLUE_SERVICE:      ${{ vars.BLUE_SERVICE }}
+  GREEN_SERVICE:     ${{ vars.GREEN_SERVICE }}
+  ALB_DNS:           ${{ vars.ALB_DNS }}
+
+jobs:
+  # ── Job 1: Build and push image ─────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Determine image tag
+        id: meta
+        run: |
+          if [[ -n "${{ inputs.image_tag }}" ]]; then
+            echo "tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            # Semver tag if pushed as tag, else SHA
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              TAG="${GITHUB_REF#refs/tags/}"
+            else
+              TAG="sha-${GITHUB_SHA::8}"
+            fi
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push
+        if: steps.meta.outputs.skip_build != 'true'
+        run: |
+          IMAGE="${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}"
+          docker build \
+            --build-arg APP_VERSION="${{ steps.meta.outputs.tag }}" \
+            -t "$IMAGE" \
+            app/
+          docker push "$IMAGE"
+          echo "✅ Pushed $IMAGE"
+
+  # ── Job 2: Deploy to idle environment ───────────────────────────────────────
+  deploy-idle:
+    name: Deploy to Idle
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      idle_color:   ${{ steps.detect.outputs.idle }}
+      active_color: ${{ steps.detect.outputs.active }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Detect active / idle color
+        id: detect
+        run: |
+          chmod +x scripts/get_active.sh
+          ACTIVE=$(./scripts/get_active.sh)
+          IDLE=$(./scripts/get_active.sh 2>&1 >/dev/null)
+          echo "active=$ACTIVE" >> $GITHUB_OUTPUT
+          echo "idle=$IDLE"     >> $GITHUB_OUTPUT
+          echo "Active: $ACTIVE | Idle: $IDLE"
+
+      - name: Register new task definition and deploy to idle
+        run: |
+          IDLE="${{ steps.detect.outputs.idle_color }}"
+          IMAGE="${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}"
+          FAMILY="bluegreen-${IDLE}"
+
+          # Get current task def, update image
+          CURRENT_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$FAMILY" \
+            --query 'taskDefinition' --output json)
+
+          NEW_DEF=$(echo "$CURRENT_DEF" | jq \
+            --arg IMAGE "$IMAGE" \
+            --arg VERSION "${{ needs.build.outputs.image_tag }}" \
+            --arg FAIL "${{ inputs.force_fail }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             (.containerDefinitions[0].environment[] | select(.name == "APP_VERSION")).value = $VERSION |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          echo "Registered: $NEW_ARN"
+
+          # Update the idle ECS service
+          if [[ "$IDLE" == "blue" ]]; then
+            SERVICE="${{ env.BLUE_SERVICE }}"
+          else
+            SERVICE="${{ env.GREEN_SERVICE }}"
+          fi
+
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "$SERVICE" \
+            --task-definition "$NEW_ARN" \
+            --desired-count 1 > /dev/null
+
+          echo "Waiting for $IDLE to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "$SERVICE"
+
+          echo "✅ $IDLE is stable with ${{ needs.build.outputs.image_tag }}"
+
+  # ── Job 3: Smoke test idle environment ──────────────────────────────────────
+  smoke-test:
+    name: Smoke Test (Idle)
+    runs-on: ubuntu-latest
+    needs: [build, deploy-idle]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run smoke tests against idle (port 8443)
+        run: |
+          chmod +x scripts/smoke_test.sh
+          ./scripts/smoke_test.sh "${{ needs.build.outputs.image_tag }}"
+
+  # ── Job 4: Manual approval gate ─────────────────────────────────────────────
+  approve:
+    name: Approve Cutover
+    runs-on: ubuntu-latest
+    needs: [smoke-test, deploy-idle]
+    environment: ${{ inputs.auto_promote == true && 'staging' || 'production' }}
+    steps:
+      - name: Approved
+        run: echo "✅ Cutover approved — switching traffic to ${{ needs.deploy-idle.outputs.idle_color }}"
+
+  # ── Job 5: Switch traffic ────────────────────────────────────────────────────
+  switch:
+    name: Switch Traffic
+    runs-on: ubuntu-latest
+    needs: [build, deploy-idle, approve]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Switch ALB listener
+        run: |
+          chmod +x scripts/switch_traffic.sh
+          ./scripts/switch_traffic.sh \
+            "${{ needs.deploy-idle.outputs.idle_color }}" \
+            "${{ needs.deploy-idle.outputs.active_color }}"
+
+  # ── Job 6: Post-switch verification + auto-rollback ─────────────────────────
+  post-verify:
+    name: Post-Switch Verify
+    runs-on: ubuntu-latest
+    needs: [build, deploy-idle, switch]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Monitor for 5 minutes (bake window)
+        id: monitor
+        run: |
+          chmod +x scripts/rollback.sh
+          NEW_COLOR="${{ needs.deploy-idle.outputs.idle_color }}"
+          OLD_COLOR="${{ needs.deploy-idle.outputs.active_color }}"
+          BAKE_SECONDS=300    # 5 minute bake window
+          CHECK_INTERVAL=15   # check every 15s
+          ERROR_THRESHOLD=2   # % 5xx error rate to trigger rollback
+
+          echo "⏱ Bake window: ${BAKE_SECONDS}s  (checking every ${CHECK_INTERVAL}s)"
+
+          START=$(date +%s)
+          while (( $(date +%s) - START < BAKE_SECONDS )); do
+            ELAPSED=$(( $(date +%s) - START ))
+
+            # Check /version endpoint
+            RESPONSE=$(curl -sf "http://${{ env.ALB_DNS }}/version" 2>/dev/null || echo '{}')
+            LIVE_COLOR=$(echo "$RESPONSE" | jq -r '.color // "unknown"')
+            LIVE_VER=$(echo "$RESPONSE" | jq -r '.version // "unknown"')
+
+            # Check for 5xx errors in the last minute
+            ERRORS=$(aws cloudwatch get-metric-statistics \
+              --namespace AWS/ApplicationELB \
+              --metric-name HTTPCode_Target_5XX_Count \
+              --dimensions \
+                Name=LoadBalancer,Value="$(aws elbv2 describe-load-balancers --query "LoadBalancers[?LoadBalancerName=='bluegreen-alb'].LoadBalancerArn" --output text | sed 's|.*app/|app/|')" \
+              --start-time "$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -v-1M +%Y-%m-%dT%H:%M:%S)" \
+              --end-time "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+              --period 60 --statistics Sum \
+              --query 'Datapoints[0].Sum' --output text 2>/dev/null || echo "0")
+
+            echo "[${ELAPSED}s] color=$LIVE_COLOR version=$LIVE_VER 5xx_last_min=${ERRORS:-0}"
+
+            if [[ "${ERRORS:-0}" != "None" ]] && (( $(echo "${ERRORS:-0} > $ERROR_THRESHOLD" | bc -l) )); then
+              echo "❌ Error rate exceeded threshold (${ERRORS} 5xx). Triggering auto-rollback."
+              ./scripts/rollback.sh --reason "auto: 5xx=${ERRORS} > threshold=${ERROR_THRESHOLD}"
+              exit 1
+            fi
+
+            if [[ "$LIVE_COLOR" != "$NEW_COLOR" ]]; then
+              echo "❌ Unexpected color: $LIVE_COLOR (expected $NEW_COLOR). Triggering rollback."
+              ./scripts/rollback.sh --reason "auto: wrong color $LIVE_COLOR"
+              exit 1
+            fi
+
+            sleep $CHECK_INTERVAL
+          done
+
+          echo "✅ Bake window complete — deployment successful"

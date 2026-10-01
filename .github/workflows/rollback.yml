@@ -1,0 +1,46 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        default: 'manual rollback'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:        ${{ vars.AWS_REGION }}
+  PROD_LISTENER_ARN: ${{ vars.PROD_LISTENER_ARN }}
+  TEST_LISTENER_ARN: ${{ vars.TEST_LISTENER_ARN }}
+  TG_BLUE_ARN:       ${{ vars.TG_BLUE_ARN }}
+  TG_GREEN_ARN:      ${{ vars.TG_GREEN_ARN }}
+  ALB_DNS:           ${{ vars.ALB_DNS }}
+
+jobs:
+  rollback:
+    name: Rollback Traffic
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Execute rollback
+        run: |
+          chmod +x scripts/rollback.sh scripts/get_active.sh
+          ROLLBACK_REASON="${{ inputs.reason }}" ./scripts/rollback.sh
+
+      - name: Confirm rollback
+        run: |
+          sleep 5
+          RESPONSE=$(curl -sf "http://${{ env.ALB_DNS }}/version")
+          echo "Live version after rollback: $RESPONSE"
