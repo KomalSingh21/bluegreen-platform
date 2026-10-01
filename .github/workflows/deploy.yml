@@ -102,12 +102,20 @@ jobs:
       - name: Detect active / idle color
         id: detect
         run: |
-          chmod +x scripts/get_active.sh
-          ACTIVE=$(./scripts/get_active.sh)
-          IDLE=$(./scripts/get_active.sh 2>/dev/null)
-          echo "active=$ACTIVE" >> $GITHUB_OUTPUT
-          echo "idle=$IDLE"     >> $GITHUB_OUTPUT
-          echo "Active: $ACTIVE | Idle: $IDLE"
+            chmod +x scripts/get_active.sh
+        
+            ACTIVE=$(./scripts/get_active.sh)
+        
+            if [[ "$ACTIVE" == "blue" ]]; then
+              IDLE="green"
+            else
+              IDLE="blue"
+            fi
+        
+            echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+            echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
+        
+            echo "Active: $ACTIVE | Idle: $IDLE"      
 
       - name: Register new task definition and deploy to idle
         run: |
