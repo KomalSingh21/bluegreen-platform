@@ -104,14 +104,14 @@ jobs:
         run: |
           chmod +x scripts/get_active.sh
           ACTIVE=$(./scripts/get_active.sh)
-          IDLE=$(./scripts/get_active.sh 2>&1 >/dev/null)
+          IDLE=$(./scripts/get_active.sh 2>/dev/null)
           echo "active=$ACTIVE" >> $GITHUB_OUTPUT
           echo "idle=$IDLE"     >> $GITHUB_OUTPUT
           echo "Active: $ACTIVE | Idle: $IDLE"
 
       - name: Register new task definition and deploy to idle
         run: |
-          IDLE="${{ steps.detect.outputs.idle_color }}"
+          IDLE="${{ steps.detect.outputs.idle }}"
           IMAGE="${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}"
           FAMILY="bluegreen-${IDLE}"
 
